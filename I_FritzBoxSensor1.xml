@@ -1,0 +1,359 @@
+<?xml version="1.0"?>
+<implementation>
+  <settings>
+    <protocol>cr</protocol>
+  </settings>
+  <functions>
+--[[  
+Read the status of a FritzBox using the details exposed via :49000/igddesc.xml.
+
+Version 1.0 30 Dec 2016 by Rene Boer
+
+The only configuration required is to set the IP address for the FritzBox router in the ip attribute.
+	
+Some more background information
+	GitHub repository 	https://github.com/reneboer/vera-FritzBoxSensor
+]]	
+
+	local http = require("socket.http")
+	local ltn12 = require"ltn12"
+	
+    local SIDS = { 
+		PLG		= "urn:rboer-com:serviceId:FritzBoxSensor",
+		HA_DEV	= "urn:micasaverde-com:serviceId:HaDevice1",
+		ZW_DEV	= "urn:micasaverde-com:serviceId:ZWaveDevice1",
+		SEC		= "urn:micasaverde-com:serviceId:SecuritySensor1"
+	}
+    local DATA = {
+		Disabled 	= false,
+		DebugMode 	= true,
+		Device 		= nil,
+		ip 			= nil,
+		Version		= "1.0",
+		varPrefx	= "fritz.",
+		Description	= "FritzBox Sensor"
+	}
+	-- Get variable and catch nil value
+	local function varGet(name, service, device)
+		local value = luup.variable_get(service or SIDS.PLG, name, tonumber(device or DATA.Device))
+		return (value or '')
+	end
+	-- Update variable when value is different than current.
+	local function varSet(name, value, service, device)
+		local service = service or SIDS.PLG
+		local device = tonumber(device or DATA.Device)
+		local old = varGet(name, service, device)
+		if (tostring(value) ~= tostring(old)) then 
+			luup.variable_set(service, name, value, device)
+		end
+	end
+	-- Device details from the igddesc.xml file
+	local DEVICE_DATA = {
+		 { var = "FriendlyName", tag = "friendlyName" },
+		 { var = "ManufacturerURL", tag = "manufacturerURL" },
+		 { var = "Manufacturer", tag = "manufacturer" },
+		 { var = "ModelName", tag = "modelName" }
+	}
+	-- Possible values for LastConnectionError used to check alarm status or not.
+	local ERROR_DATA = {
+		["ERROR_NONE"] = false,
+		["ERROR_ISP_TIME_OUT"] = true,
+		["ERROR_COMMAND_ABORTED"] = true,
+		["ERROR_NOT_ENABLED_FOR_INTERNET"] = true,
+		["ERROR_BAD_PHONE_NUMBER"] = true,
+		["ERROR_USER_DISCONNECT"] = true,
+		["ERROR_ISP_DISCONNECT"] = true,
+		["ERROR_IDLE_DISCONNECT"] = true,
+		["ERROR_FORCED_DISCONNECT"] = true,
+		["ERROR_SERVER_OUT_OF_RESOURCES"] = true,
+		["ERROR_RESTRICTED_LOGON_HOURS"] = true,
+		["ERROR_ACCOUNT_DISABLED"] = true,
+		["ERROR_ACCOUNT_EXPIRED"] = true,
+		["ERROR_PASSWORD_EXPIRED"] = true,
+		["ERROR_AUTHENTICATION_FAILURE"] = true,
+		["ERROR_NO_DIALTONE"] = true,
+		["ERROR_NO_CARRIER"] = true,
+		["ERROR_NO_ANSWER"] = true,
+		["ERROR_LINE_BUSY"] = true,
+		["ERROR_UNSUPPORTED_BITSPERSECOND"] = true,
+		["ERROR_TOO_MANY_LINE_ERRORS"] = true,
+		["ERROR_IP_CONFIGURATION"] = true,
+		["ERROR_UNKNOWN"] = true
+	}	
+
+	-- Status information from the Fritz
+	-- Based on igddesc.xml schema. For each action tag the variable to store the value in is specified. 
+	-- When process is false the action tag is not processed and the variable does not get set.
+	-- The fmt function can be used for extra processing and formatting.
+	local STATUS_DATA = {
+		{ location = "igdupnp/control/WANIPConn1", service = "WANIPConnection", 
+		  actionList = { 
+			{ action = "GetStatusInfo", 
+				respList = { 
+					{ tag = "NewConnectionStatus", var = "ConnectionStatus", process = true }, 
+					{ tag = "NewLastConnectionError", var = "LastConnectionError", process = true, 
+						fmt = function(val) 
+							-- Use connection status to determine alarm status
+							if ERROR_DATA[val] == nil then val = "ERROR_UNKNOWN" end
+							if ERROR_DATA[val] then
+								-- Alarm condition, set tripped
+								varSet("Tripped", "1", SIDS.SEC)
+								varSet("LastTrip", os.time(), SIDS.SEC)
+								local armed = varGet("Armed", SIDS.SEC)
+								varSet("ArmedTripped", armed, SIDS.SEC)
+							else
+								-- No alarm condition, clear tripped
+								varSet("Tripped", "0", SIDS.SEC)
+								varSet("ArmedTripped", "0", SIDS.SEC)
+							end
+							return val
+						end	
+					},
+					{ tag = "NewUptime", var = "Uptime", process = true, 
+						fmt = function(val) 
+							-- format uptime to days and time
+							local upt = tonumber(val)
+							local sec = math.fmod(upt,60)
+							local tmp = math.floor(upt/(60))
+							local min = math.fmod(tmp,60)
+							tmp = math.floor(tmp/(60))
+							local hrs = math.fmod(tmp,24)
+							local days =math.floor(tmp/24)
+							return string.format("%d days, %d:%02d:%02d", days,hrs,min,sec)
+						end 
+					}
+				}
+			},
+			{ action = "GetConnectionTypeInfo", 
+				respList = { 
+					{ tag = "NewConnectionType", var = "ConnectionType", process = false }, 
+					{ tag = "NewPossibleConnectionTypes", var = "PossibleConnectionTypes", process = false }
+				}
+			},
+			{ action = "GetNATRSIPStatus", 
+				respList = { 
+					{ tag = "NewRSIPAvailable", var = "RSIPAvailable", process = false }, 
+					{ tag = "NewNATEnabled", var = "NATEnabled", process = false }
+				}
+			},
+			{ action = "GetExternalIPAddress", 
+				respList = { 
+					{ tag = "NewExternalIPAddress", var = "ExternalIPAddress", process = true }
+				}
+			}
+		}},
+		{ location = "igdupnp/control/WANCommonIFC1", service = "WANCommonInterfaceConfig", 
+		  actionList = { 
+			{ action = "GetCommonLinkProperties", 
+				respList = { 
+					{ tag = "NewWANAccessType", var = "WANAccessType", process = true }, 
+					{ tag = "NewLayer1UpstreamMaxBitRate", var = "Layer1UpstreamMaxBitRate", process = true }, 
+					{ tag = "NewLayer1DownstreamMaxBitRate", var = "Layer1DownstreamMaxBitRate", process = true }, 
+					{ tag = "NewPhysicalLinkStatus", var = "PhysicalLinkStatus", process = true } 
+				}
+			},
+			{ action = "GetAddonInfos", 
+				respList = { 
+					{ tag = "NewByteSendRate", var = "ByteSendRate", process = true }, 
+					{ tag = "NewByteReceiveRate", var = "ByteReceiveRate", process = true }, 
+					{ tag = "NewPacketSendRate", var = "PacketSendRate", process = true }, 
+					{ tag = "NewPacketReceiveRate", var = "PacketReceiveRate", process = true }, 
+					{ tag = "NewTotalBytesSent", var = "TotalBytesSent", process = true }, 
+					{ tag = "NewTotalBytesReceived", var = "TotalBytesReceived", process = true }, 
+					{ tag = "NewAutoDisconnectTime", var = "AutoDisconnectTime", process = true }, 
+					{ tag = "NewIdleDisconnectTime", var = "IdleDisconnectTime", process = true }, 
+					{ tag = "NewDNSServer1", var = "DNSServer1", process = true }, 
+					{ tag = "NewDNSServer2", var = "DNSServer2", process = true }, 
+					{ tag = "NewVoipDNSServer1", var = "VoipDNSServer1", process = false }, 
+					{ tag = "NewVoipDNSServer2", var = "VoipDNSServer2", process = false }, 
+					{ tag = "NewUpnpControlEnabled", var = "UpnpControlEnabled", process = false }, 
+					{ tag = "NewRoutedBridgedModeBoth", var = "RoutedBridgedModeBoth", process = false }
+				}
+			}
+		}},
+		{ location = "igdupnp/control/WANDSLLinkC1", service = "WANDSLLinkConfig", 
+		  actionList = { 
+			{ action = "GetDSLLinkInfo", 
+				respList = { 
+					{ tag = "NewLinkType", var = "LinkType", process = true }, 
+					{ tag = "NewLinkStatus", var = "LinkStatus", process = true } 
+				}
+			},
+			{ action = "GetModulationType", 
+				respList = { 
+					{ tag = "NewModulationType", var = "ModulationType", process = true }
+				}
+			}
+		}}
+	}
+	-- simple logging wrapper
+    function log(text, lev)
+		local lev = (lev or 10)
+        luup.log(DATA.Description .. ": "..text, lev)
+    end
+	-- Allow for extra loggin for debugging purposes
+    function debug(text)
+        if (DATA.DebugMode == true) then
+            log(text)
+        end
+    end
+	--get device Variables, creating with default value if non-existent
+	local function defVar(name, default, service, device)
+		local service = service or SIDS.PLG
+		local device = tonumber(device or DATA.Device)
+		local value = luup.variable_get(service, name, device) 
+		if (not value) then
+			value = default	or ''							-- use default value or blank
+			luup.variable_set(service, name, value, device)	-- create missing variable with default value
+		end
+		return value
+	end
+	-- Send status read requests for an action
+	local function readFritzStatusItem(ip,loc,ser,act) 
+		local dt = "urn:schemas-upnp-org:service:"..ser..":1"
+		local st = "urn:upnp.org:service:"..ser..":1"
+		local bdy = '&lt;?xml version="1.0" encoding="utf-8"?>&lt;s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">&lt;s:Body>&lt;u:'..act..' xmlns:u="'..st..'">&lt;/u:'..act..'>&lt;/s:Body>&lt;/s:Envelope>'
+		local respbody = {}
+ 
+		local r, c, h, s = http.request {
+			method = "POST",
+			url = "http://"..ip..":49000/"..loc,
+			source = ltn12.source.string(bdy),
+			headers = {
+				["content-type"] = 'text/xml; charset="utf-8"',
+				["content-length"] = tostring(#bdy),
+				["SoapAction"] = dt.."#"..act
+			},
+			sink = ltn12.sink.table(respbody)
+		}
+		if (c == 200) then
+			respbody = table.concat(respbody)
+			return true, respbody
+		else
+			return false, nil
+		end    
+	end
+	-- Read the device data as defined in DEVICE_DATA from the FritzBox. Only once at startup as it is pretty static.
+	local function readFritzData(ip) 
+		local res = false
+		local stat, resp = luup.inet.wget("http://"..ip..":49000/igddesc.xml")
+		if stat == 0 then
+			for i, d_item in pairs(DEVICE_DATA) do
+				local val = resp:match("&lt;"..d_item.tag..">(.-)&lt;/"..d_item.tag..">")
+				if val ~= nil then 
+					varSet(DATA.varPrefx..d_item.var, val)
+					res = true
+				end	
+			end	
+		end
+		return res
+	end
+	-- Read all the status data information defined in STATUS_DATA from the FritzBox
+	local function readFritzStatus(ip) 
+		local res = false
+		for _, srv_item in pairs(STATUS_DATA) do
+			for _, act_item in pairs(srv_item.actionList) do
+				local stat, resp = readFritzStatusItem(ip,srv_item.location,srv_item.service,act_item.action)
+				if stat then
+        			for _, val_item in pairs(act_item.respList) do
+						local val = resp:match("&lt;"..val_item.tag..">(.-)&lt;/"..val_item.tag..">")
+						if val_item.process then 
+							if val_item.fmt then val = val_item.fmt(val) end
+							if val ~= nil then 
+								varSet(DATA.varPrefx..val_item.var, val) 
+								res = true
+							end	
+						end
+                    end
+				end	
+			end
+		end	
+		return res
+	end
+
+	-- Poll the FritzBox Status report and update plugin status
+    function refreshCache()
+        debug("refreshCache called")
+        -- Get polling period
+        local period = tonumber(varGet("PollSettings", SIDS.ZW_DEV))
+        if ((period ~= 0 and period &lt; 10) or period > 3600) then period = 300 end
+        if (period ~=0) then luup.call_delay("refreshCache", period) end
+		-- Get status details
+		local stat = readFritzStatus(DATA.ip)
+		if stat then
+			debug("Successful status read from " .. DATA.ip)
+			varSet("LastUpdate", os.time(), SIDS.HA_DEV)
+			local pc = tonumber(varGet("PollOk", SIDS.ZW_DEV)) + 1
+			varSet("PollOk", pc, SIDS.ZW_DEV)
+		else
+			local pc = tonumber(varGet("PollNoReply", SIDS.ZW_DEV)) + 1
+			varSet("PollNoReply", pc, SIDS.ZW_DEV)
+			log("refreshCache failed",3)
+		end
+    end
+
+    function startup(parentDevice)
+		-- See if plugin is disabled
+		local isDisabled = luup.attr_get("disabled", parentDevice)
+		if ((isDisabled == 1) or (isDisabled == "1")) then
+			log("Init: Plug-in - DISABLED",2)
+			DATA.Disabled = true
+			-- Now we are done. Mark device as disabled
+			return true, "Plug-in Disabled.", DATA.Description
+		end
+		DATA.Device = parentDevice
+        -- Set defaults for varaibles.
+        defVar("Version", DATA.Version)
+        defVar("PollSettings", "300", SIDS.ZW_DEV)
+        defVar("PollOk", "0", SIDS.ZW_DEV)
+        defVar("PollNoReply", "0", SIDS.ZW_DEV)
+		defVar("Tripped", "0", SIDS.SEC)
+		defVar("Armed", "0", SIDS.SEC)
+		defVar("ArmedTripped", "0", SIDS.SEC)
+        -- Validate that the IP address for FritzBox is configured in Vera.
+		local ipa = luup.attr_get("ip", DATA.Device)
+		local ipAddress = string.match(ipa, '^(%d%d?%d?%.%d%d?%d?%.%d%d?%d?%.%d%d?%d?)')
+		if (ipAddress == nil) then
+			log("IP address is not configured",2)
+			varSet("Status", "Configure IP Address.")
+			luup.set_failure(1, DATA.Device)
+			return false, "Configure IP Address.", DATA.Description
+		end
+		DATA.ip = ipAddress
+        log(" #" .. tostring(DATA.Device) .. " starting up with ip " .. DATA.ip)
+		if readFritzData(DATA.ip) then
+			defVar("Configured", "1", SIDS.HA_DEV)
+			defVar("FirstConfigured", os.time(), SIDS.HA_DEV)
+
+			-- Start polling
+			luup.call_delay("refreshCache", 60)
+			luup.set_failure(0, DATA.Device)
+			return true
+		else
+			log("FritzBox at IP address "..DATA.ip.." is not responding as expected.",2)
+			luup.set_failure(2, DATA.Device)
+			return false, "Unable to read FritzBox data.", DATA.Description
+		end
+    end
+  </functions>
+  <incoming>
+  </incoming>
+  <startup>startup</startup>
+  <actionList>
+    <action>
+      <serviceId>urn:micasaverde-com:serviceId:SecuritySensor1</serviceId>
+      <name>SetArmed</name>
+      <run>
+        varSet("Armed", lul_settings.newArmedValue or "0", SIDS.SEC)
+      </run>
+    </action>
+    <action>
+      <serviceId>urn:micasaverde-com:serviceId:HaDevice1</serviceId>
+      <name>Poll</name>
+      <run>
+        -- Force refreshCache to get called in a Timer
+        luup.call_timer("refreshCache", 1, "1", "")
+      </run>
+    </action>
+    </actionList>
+</implementation>
